@@ -5,6 +5,9 @@ import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import createMenuRoutes from "./routes/menuRoutes.js";
+import { toNodeHandler } from "better-auth/node";
+import { createAuth } from "./config/auth.js";
+
 import { MongoClient, ServerApiVersion } from "mongodb";
 
 const app = express();
@@ -35,6 +38,11 @@ async function startServer() {
         console.log("MongoDB Connected Successfully!");
 
         const db = client.db("pizzahub_db");
+
+        const auth = createAuth(db, client);
+
+        app.all("/api/auth/*splat", toNodeHandler(auth));
+
         const menuCollection = db.collection("menuItems");
         app.use("/api/menu", createMenuRoutes(menuCollection));
 
