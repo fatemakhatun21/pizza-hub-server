@@ -4,6 +4,7 @@ dns.setServers(["8.8.8.8", "1.1.1.1"]);
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
+import createMenuRoutes from "./routes/menuRoutes.js";
 import { MongoClient, ServerApiVersion } from "mongodb";
 
 const app = express();
@@ -35,6 +36,7 @@ async function startServer() {
 
         const db = client.db("pizzahub_db");
         const menuCollection = db.collection("menuItems");
+        app.use("/api/menu", createMenuRoutes(menuCollection));
 
         app.get("/", (req, res) => {
             res.send("PizzaHub Server is Running!");
