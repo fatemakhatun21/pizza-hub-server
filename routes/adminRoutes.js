@@ -181,6 +181,52 @@ export default function createAdminRoutes(db, auth) {
                     });
                 }
 
+                if (status === "approved") {
+                    const pizza = await menuCollection.findOne({
+                        _id: new ObjectId(id),
+                        status: "pending",
+                    });
+
+                    if (!pizza) {
+                        return res.status(409).json({
+                            message: "Pizza not found or no longer pending",
+                        });
+                    }
+
+                    if (!pizza.vendorId || !ObjectId.isValid(pizza.vendorId)) {
+                        return res.status(400).json({
+                            message: "Pizza has an invalid vendor ID",
+                        });
+                    }
+
+                    const vendor = await usersCollection.findOne({
+                        _id: new ObjectId(pizza.vendorId),
+                        role: "vendor",
+                        blocked: { $ne: true },
+                    });
+
+                    if (!vendor) {
+                        return res.status(403).json({
+                            message: "Vendor account is unavailable",
+                        });
+                    }
+
+                    if (vendor.plan !== "premium") {
+                        const activeCount = await menuCollection.countDocuments({
+                            vendorId: pizza.vendorId,
+                            status: "approved",
+                            isActive: true,
+                        });
+
+                        if (activeCount >= 3) {
+                            return res.status(403).json({
+                                message:
+                                    "Free vendors can have a maximum of 3 active pizzas",
+                            });
+                        }
+                    }
+                }
+
                 const result = await menuCollection.updateOne(
                     {
                         _id: new ObjectId(id),
