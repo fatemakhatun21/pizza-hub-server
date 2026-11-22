@@ -7,6 +7,7 @@ import { MongoClient, ServerApiVersion, ObjectId } from "mongodb";
 import { toNodeHandler, fromNodeHeaders } from "better-auth/node";
 
 import createMenuRoutes from "./routes/menuRoutes.js";
+import createAdminRoutes from "./routes/adminRoutes.js";
 import { createAuth } from "./config/auth.js";
 
 const app = express();
@@ -124,6 +125,7 @@ async function startServer() {
 
         const menuCollection = db.collection("menuItems");
         app.use("/api/menu", createMenuRoutes(menuCollection, auth, db));
+        app.use("/api/admin", createAdminRoutes(db, auth));
 
         app.get("/", (req, res) => {
             res.send("PizzaHub Server is Running!");
