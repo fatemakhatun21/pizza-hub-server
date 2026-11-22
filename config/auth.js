@@ -14,6 +14,17 @@ export function createAuth(db, client) {
             "http://localhost:3000",
         ],
 
+        user: {
+            additionalFields: {
+                role: {
+                    type: "string",
+                    required: false,
+                    defaultValue: "customer",
+                    input: false,
+                },
+            },
+        },
+
         emailAndPassword: {
             enabled: true,
             minPasswordLength: 6,

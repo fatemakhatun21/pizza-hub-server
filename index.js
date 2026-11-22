@@ -1,14 +1,13 @@
 import dns from "node:dns";
-
 dns.setServers(["8.8.8.8", "1.1.1.1"]);
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
-import createMenuRoutes from "./routes/menuRoutes.js";
-import { toNodeHandler } from "better-auth/node";
-import { createAuth } from "./config/auth.js";
+import { MongoClient, ServerApiVersion, ObjectId } from "mongodb";
+import { toNodeHandler, fromNodeHeaders } from "better-auth/node";
 
-import { MongoClient, ServerApiVersion } from "mongodb";
+import createMenuRoutes from "./routes/menuRoutes.js";
+import { createAuth } from "./config/auth.js";
 
 const app = express();
 const port = process.env.PORT || 5000;
@@ -19,7 +18,6 @@ app.use(
         credentials: true,
     })
 );
-app.use(express.json());
 
 const uri = process.env.MONGODB_URI;
 
@@ -43,28 +41,92 @@ async function startServer() {
         console.log("MongoDB Connected Successfully!");
 
         const db = client.db("pizzahub_db");
-
         const auth = createAuth(db, client);
 
         app.all("/api/auth/*splat", toNodeHandler(auth));
 
+        app.use(express.json());
+
+        const verifySession = async (req, res, next) => {
+            try {
+                const session = await auth.api.getSession({
+                    headers: fromNodeHeaders(req.headers),
+                });
+
+                if (!session?.user) {
+                    return res.status(401).json({
+                        message: "Unauthorized. Please sign in.",
+                    });
+                }
+
+                req.user = session.user;
+                req.session = session.session;
+
+                next();
+            } catch (error) {
+                console.error("Session verification error:", error.message);
+
+                return res.status(500).json({
+                    message: "Unable to verify session.",
+                });
+            }
+        };
+
+        app.get("/api/me", verifySession, (req, res) => {
+            res.status(200).json({
+                user: req.user,
+            });
+        });
+
+
+
+        app.post("/api/vendor/register", verifySession, async (req, res) => {
+            try {
+                const usersCollection = db.collection("user");
+
+                if (!ObjectId.isValid(req.user.id)) {
+                    return res.status(400).json({
+                        message: "Invalid user ID",
+                    });
+                }
+
+                const result = await usersCollection.updateOne(
+                    {
+                        _id: new ObjectId(req.user.id),
+                        role: "customer",
+                    },
+                    {
+                        $set: {
+                            role: "vendor",
+                            updatedAt: new Date(),
+                        },
+                    }
+                );
+
+                if (result.matchedCount === 0) {
+                    return res.status(403).json({
+                        message: "Only customers can register as vendors",
+                    });
+                }
+
+                res.status(200).json({
+                    message: "Vendor registration successful",
+                    role: "vendor",
+                });
+            } catch (error) {
+                console.error("Vendor registration error:", error.message);
+
+                res.status(500).json({
+                    message: "Failed to register vendor",
+                });
+            }
+        });
+
         const menuCollection = db.collection("menuItems");
-        app.use("/api/menu", createMenuRoutes(menuCollection));
+        app.use("/api/menu", createMenuRoutes(menuCollection, auth, db));
 
         app.get("/", (req, res) => {
             res.send("PizzaHub Server is Running!");
-        });
-
-        app.get("/api/menu", async (req, res) => {
-            try {
-                const items = await menuCollection.find().toArray();
-                res.json(items);
-            } catch (error) {
-                console.error("Failed to fetch menu:", error.message);
-                res.status(500).json({
-                    message: "Failed to fetch menu items",
-                });
-            }
         });
 
         app.listen(port, () => {
