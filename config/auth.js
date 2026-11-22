@@ -64,6 +64,13 @@ export function getTrustedOrigins() {
 
 export function createAuth(db, client) {
     return betterAuth({
+        advanced: {
+            useSecureCookies: true,
+            defaultCookieAttributes: {
+                sameSite: "none",
+                secure: true,
+            },
+        },
         plugins: [
             jwt(),
         ],
