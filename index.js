@@ -96,6 +96,7 @@ async function startServer() {
                     {
                         _id: new ObjectId(req.user.id),
                         role: "customer",
+                        blocked: { $ne: true },
                     },
                     {
                         $set: {

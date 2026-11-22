@@ -31,7 +31,7 @@ export default function createOrderRoutes(db, auth) {
                 _id: new ObjectId(session.user.id),
             });
 
-            if (!user) {
+            if (!user || user.blocked === true) {
                 return res.status(401).json({
                     message: "User not found",
                 });

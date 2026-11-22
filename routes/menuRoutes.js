@@ -21,7 +21,7 @@ export default function createMenuRoutes(menuCollection, auth, db) {
                 _id: new ObjectId(session.user.id),
             });
 
-            if (!user || user.role !== "vendor") {
+            if (!user || user.role !== "vendor" || user.blocked === true) {
                 return res.status(403).json({
                     message: "Only vendors can manage menu items",
                 });
