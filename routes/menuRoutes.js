@@ -27,7 +27,10 @@ export default function createMenuRoutes(menuCollection, auth, db) {
                 });
             }
 
-            req.user = user;
+            req.user = {
+                ...user,
+                id: session.user.id,
+            };
             next();
         } catch (error) {
             console.error("Authorization error:", error.message);
@@ -184,12 +187,11 @@ export default function createMenuRoutes(menuCollection, auth, db) {
                 });
             }
 
-            if (existingItem.vendorId !== req.user.id) {
+            if (String(existingItem.vendorId) !== String(req.user.id)) {
                 return res.status(403).json({
                     message: "You can only edit your own pizzas",
                 });
             }
-
             const allowedFields = [
                 "name",
                 "description",
