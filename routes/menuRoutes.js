@@ -54,6 +54,7 @@ export default function createMenuRoutes(menuCollection, auth, db) {
                     status: "approved",
                     isActive: true,
                 })
+                .sort({ isFeatured: -1, createdAt: -1 })
                 .toArray();
 
             res.status(200).json(items);
@@ -101,6 +102,7 @@ export default function createMenuRoutes(menuCollection, auth, db) {
 
                 status: "pending",
                 isActive: false,
+                isFeatured: false,
                 createdAt: new Date(),
             };
 
@@ -132,6 +134,53 @@ export default function createMenuRoutes(menuCollection, auth, db) {
 
             res.status(500).json({
                 message: "Failed to fetch your pizzas",
+            });
+        }
+    });
+
+    router.get("/featured", async (req, res) => {
+        try {
+            const parsedLimit = Number.parseInt(req.query.limit, 10);
+            const limit =
+                Number.isFinite(parsedLimit) && parsedLimit > 0
+                    ? Math.min(parsedLimit, 12)
+                    : 6;
+
+            const baseQuery = {
+                status: "approved",
+                isActive: true,
+            };
+
+            const featured = await menuCollection
+                .find({
+                    ...baseQuery,
+                    isFeatured: true,
+                })
+                .sort({ createdAt: -1 })
+                .limit(limit)
+                .toArray();
+
+            let items = featured;
+
+            if (featured.length < limit) {
+                const fillers = await menuCollection
+                    .find({
+                        ...baseQuery,
+                        _id: { $nin: featured.map((item) => item._id) },
+                    })
+                    .sort({ createdAt: -1 })
+                    .limit(limit - featured.length)
+                    .toArray();
+
+                items = [...featured, ...fillers];
+            }
+
+            res.status(200).json(items);
+        } catch (error) {
+            console.error("Featured menu fetch error:", error.message);
+
+            res.status(500).json({
+                message: "Failed to fetch featured pizzas",
             });
         }
     });
@@ -192,7 +241,8 @@ export default function createMenuRoutes(menuCollection, auth, db) {
                     message: "You can only edit your own pizzas",
                 });
             }
-            const allowedFields = [
+            const body = req.body ?? {};
+            const editableFields = [
                 "name",
                 "description",
                 "category",
@@ -201,19 +251,51 @@ export default function createMenuRoutes(menuCollection, auth, db) {
                 "image",
             ];
 
-            const updates = Object.fromEntries(
-                Object.entries(req.body ?? {}).filter(([key]) =>
-                    allowedFields.includes(key)
-                )
+            const hasFeaturedUpdate = Object.prototype.hasOwnProperty.call(
+                body,
+                "isFeatured"
+            );
+            const hasOtherUpdates = editableFields.some((key) =>
+                Object.prototype.hasOwnProperty.call(body, key)
             );
 
-            if (Object.keys(updates).length === 0) {
+            if (!hasFeaturedUpdate && !hasOtherUpdates) {
                 return res.status(400).json({
                     message: "No valid fields provided for update",
                 });
             }
 
+            if (hasFeaturedUpdate) {
+                if (req.user.plan !== "premium") {
+                    return res.status(403).json({
+                        message: "Only premium vendors can feature pizzas",
+                    });
+                }
+
+                if (typeof body.isFeatured !== "boolean") {
+                    return res.status(400).json({
+                        message: "isFeatured must be true or false",
+                    });
+                }
+            }
+
+            const updates = {};
+
+            for (const key of editableFields) {
+                if (Object.prototype.hasOwnProperty.call(body, key)) {
+                    updates[key] = body[key];
+                }
+            }
+
+            if (hasFeaturedUpdate) {
+                updates.isFeatured = body.isFeatured;
+            }
+
             for (const [key, value] of Object.entries(updates)) {
+                if (key === "isFeatured") {
+                    continue;
+                }
+
                 if (key === "price") {
                     if (
                         typeof value !== "number" ||
@@ -232,18 +314,21 @@ export default function createMenuRoutes(menuCollection, auth, db) {
                     updates[key] = value.trim();
                 }
             }
+
+            if (hasOtherUpdates) {
+                updates.status = "pending";
+                updates.isActive = false;
+            }
+
+            updates.updatedAt = new Date();
+
             const result = await menuCollection.updateOne(
                 {
                     _id: new ObjectId(id),
                     vendorId: req.user.id,
                 },
                 {
-                    $set: {
-                        ...updates,
-                        status: "pending",
-                        isActive: false,
-                        updatedAt: new Date(),
-                    },
+                    $set: updates,
                 }
             );
 
@@ -254,7 +339,9 @@ export default function createMenuRoutes(menuCollection, auth, db) {
             }
 
             res.status(200).json({
-                message: "Pizza updated and submitted for approval",
+                message: hasOtherUpdates
+                    ? "Pizza updated and submitted for approval"
+                    : "Featured status updated successfully",
             });
         } catch (error) {
             console.error("Menu update error:", error.message);

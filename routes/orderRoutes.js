@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { ObjectId } from "mongodb";
 import { fromNodeHeaders } from "better-auth/node";
+import { sendOrderStatusEmail } from "../services/emailService.js";
 
 export default function createOrderRoutes(db, auth) {
     const router = Router();
@@ -154,6 +155,13 @@ export default function createOrderRoutes(db, auth) {
                     deliveryDate: date,
 
                     status: "pending",
+                    timeline: [
+                        {
+                            status: "pending",
+                            at: new Date(),
+                            note: "Order placed",
+                        },
+                    ],
                     createdAt: new Date(),
                     updatedAt: new Date(),
                 };
@@ -230,30 +238,88 @@ export default function createOrderRoutes(db, auth) {
                     });
                 }
 
-                if (!["accepted", "rejected"].includes(status)) {
+                const allowedStatuses = [
+                    "accepted",
+                    "rejected",
+                    "preparing",
+                    "out_for_delivery",
+                    "delivered",
+                ];
+
+                if (!allowedStatuses.includes(status)) {
                     return res.status(400).json({
-                        message: "Status must be accepted or rejected",
+                        message: "Invalid order status",
                     });
                 }
+
+                const requiredCurrentStatus = {
+                    accepted: "pending",
+                    rejected: "pending",
+                    preparing: "accepted",
+                    out_for_delivery: "preparing",
+                    delivered: "out_for_delivery",
+                }[status];
+
+                const at = new Date();
 
                 const result = await orders.updateOne(
                     {
                         _id: new ObjectId(id),
                         vendorId: req.user.id,
-                        status: "pending",
+                        status: requiredCurrentStatus,
                     },
                     {
                         $set: {
                             status,
-                            updatedAt: new Date(),
+                            updatedAt: at,
+                        },
+                        $push: {
+                            timeline: {
+                                status,
+                                at,
+                                note: `Order ${status.replace(/_/g, " ")}`,
+                            },
                         },
                     }
                 );
 
                 if (result.matchedCount === 0) {
                     return res.status(409).json({
-                        message: "Order unavailable or no longer pending",
+                        message: "Order unavailable or invalid status transition",
                     });
+                }
+
+                // Email only on acceptance/rejection. Delivery issues are logged
+                // but never roll back the status change or fail this response.
+                if (status === "accepted" || status === "rejected") {
+                    try {
+                        const order = await orders.findOne({
+                            _id: new ObjectId(id),
+                        });
+
+                        if (order?.customerEmail) {
+                            const emailResult = await sendOrderStatusEmail({
+                                to: order.customerEmail,
+                                customerName: order.customerName,
+                                pizzaName: order.pizzaName,
+                                status,
+                                orderId: order._id.toString(),
+                                clientUrl: process.env.CLIENT_URL,
+                            });
+
+                            if (!emailResult.ok && !emailResult.skipped) {
+                                console.error(
+                                    "Order status email delivery failed:",
+                                    emailResult.reason ?? "unknown error"
+                                );
+                            }
+                        }
+                    } catch (emailError) {
+                        console.error(
+                            "Order status email error:",
+                            emailError.message
+                        );
+                    }
                 }
 
                 res.status(200).json({
@@ -282,6 +348,8 @@ export default function createOrderRoutes(db, auth) {
                     });
                 }
 
+                const at = new Date();
+
                 const result = await orders.updateOne(
                     {
                         _id: new ObjectId(id),
@@ -291,7 +359,14 @@ export default function createOrderRoutes(db, auth) {
                     {
                         $set: {
                             status: "cancelled",
-                            updatedAt: new Date(),
+                            updatedAt: at,
+                        },
+                        $push: {
+                            timeline: {
+                                status: "cancelled",
+                                at,
+                                note: "Order cancelled",
+                            },
                         },
                     }
                 );

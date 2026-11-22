@@ -7,6 +7,8 @@ export default function createAdminRoutes(db, auth) {
 
     const usersCollection = db.collection("user");
     const menuCollection = db.collection("menuItems");
+    const ordersCollection = db.collection("orders");
+    const transactionsCollection = db.collection("transactions");
 
     const requireAdmin = async (req, res, next) => {
         try {
@@ -260,6 +262,321 @@ export default function createAdminRoutes(db, auth) {
             }
         }
     );
+
+    router.patch(
+        "/menu/:id/feature",
+        requireAdmin,
+        async (req, res) => {
+            try {
+                const { id } = req.params;
+                const { isFeatured } = req.body ?? {};
+
+                if (!ObjectId.isValid(id)) {
+                    return res.status(400).json({
+                        message: "Invalid pizza ID",
+                    });
+                }
+
+                if (typeof isFeatured !== "boolean") {
+                    return res.status(400).json({
+                        message: "isFeatured must be true or false",
+                    });
+                }
+
+                const result = await menuCollection.updateOne(
+                    {
+                        _id: new ObjectId(id),
+                    },
+                    {
+                        $set: {
+                            isFeatured,
+                            updatedAt: new Date(),
+                        },
+                    }
+                );
+
+                if (result.matchedCount === 0) {
+                    return res.status(404).json({
+                        message: "Pizza not found",
+                    });
+                }
+
+                res.status(200).json({
+                    message: "Featured status updated successfully",
+                });
+            } catch (error) {
+                console.error("Update featured pizza error:", error.message);
+
+                res.status(500).json({
+                    message: "Failed to update featured pizza",
+                });
+            }
+        }
+    );
+
+    router.get("/stats", requireAdmin, async (req, res) => {
+        try {
+            const [
+                totalUsers,
+                customers,
+                vendors,
+                admins,
+                blockedUsers,
+                totalPizzas,
+                pendingPizzas,
+                approvedPizzas,
+                rejectedPizzas,
+                featuredPizzas,
+            ] = await Promise.all([
+                usersCollection.countDocuments({}),
+                usersCollection.countDocuments({ role: "customer" }),
+                usersCollection.countDocuments({ role: "vendor" }),
+                usersCollection.countDocuments({ role: "admin" }),
+                usersCollection.countDocuments({ blocked: true }),
+                menuCollection.countDocuments({}),
+                menuCollection.countDocuments({ status: "pending" }),
+                menuCollection.countDocuments({ status: "approved" }),
+                menuCollection.countDocuments({ status: "rejected" }),
+                menuCollection.countDocuments({ isFeatured: true }),
+            ]);
+
+            const [orderStatsDoc] = await ordersCollection
+                .aggregate([
+                    {
+                        $group: {
+                            _id: null,
+                            total: { $sum: 1 },
+                            pending: {
+                                $sum: {
+                                    $cond: [
+                                        { $eq: ["$status", "pending"] },
+                                        1,
+                                        0,
+                                    ],
+                                },
+                            },
+                            accepted: {
+                                $sum: {
+                                    $cond: [
+                                        { $eq: ["$status", "accepted"] },
+                                        1,
+                                        0,
+                                    ],
+                                },
+                            },
+                            preparing: {
+                                $sum: {
+                                    $cond: [
+                                        { $eq: ["$status", "preparing"] },
+                                        1,
+                                        0,
+                                    ],
+                                },
+                            },
+                            out_for_delivery: {
+                                $sum: {
+                                    $cond: [
+                                        {
+                                            $eq: [
+                                                "$status",
+                                                "out_for_delivery",
+                                            ],
+                                        },
+                                        1,
+                                        0,
+                                    ],
+                                },
+                            },
+                            delivered: {
+                                $sum: {
+                                    $cond: [
+                                        { $eq: ["$status", "delivered"] },
+                                        1,
+                                        0,
+                                    ],
+                                },
+                            },
+                            rejected: {
+                                $sum: {
+                                    $cond: [
+                                        { $eq: ["$status", "rejected"] },
+                                        1,
+                                        0,
+                                    ],
+                                },
+                            },
+                            cancelled: {
+                                $sum: {
+                                    $cond: [
+                                        { $eq: ["$status", "cancelled"] },
+                                        1,
+                                        0,
+                                    ],
+                                },
+                            },
+                            revenue: {
+                                $sum: {
+                                    $cond: [
+                                        { $ne: ["$status", "cancelled"] },
+                                        { $ifNull: ["$totalPrice", 0] },
+                                        0,
+                                    ],
+                                },
+                            },
+                        },
+                    },
+                ])
+                .toArray();
+
+            const orderStats = orderStatsDoc || {};
+
+            const [transactionStatsDoc] = await transactionsCollection
+                .aggregate([
+                    {
+                        $group: {
+                            _id: null,
+                            total: { $sum: 1 },
+                            completedAmount: {
+                                $sum: {
+                                    $cond: [
+                                        {
+                                            $in: [
+                                                { $ifNull: ["$status", ""] },
+                                                ["succeeded", "completed"],
+                                            ],
+                                        },
+                                        {
+                                            $convert: {
+                                                input: {
+                                                    $ifNull: [
+                                                        "$amountTotal",
+                                                        0,
+                                                    ],
+                                                },
+                                                to: "double",
+                                                onError: 0,
+                                                onNull: 0,
+                                            },
+                                        },
+                                        0,
+                                    ],
+                                },
+                            },
+                        },
+                    },
+                ])
+                .toArray();
+
+            const transactionStats = transactionStatsDoc || {};
+
+            const now = new Date();
+            const monthlyOrders = [];
+
+            for (let offset = 5; offset >= 0; offset -= 1) {
+                const monthStart = new Date(
+                    Date.UTC(
+                        now.getUTCFullYear(),
+                        now.getUTCMonth() - offset,
+                        1
+                    )
+                );
+                const monthEnd = new Date(
+                    Date.UTC(
+                        monthStart.getUTCFullYear(),
+                        monthStart.getUTCMonth() + 1,
+                        1
+                    )
+                );
+
+                const value = await ordersCollection.countDocuments({
+                    createdAt: {
+                        $gte: monthStart,
+                        $lt: monthEnd,
+                    },
+                });
+
+                monthlyOrders.push({
+                    label: monthStart.toLocaleString("en-US", {
+                        month: "short",
+                        timeZone: "UTC",
+                    }),
+                    value,
+                });
+            }
+
+            res.status(200).json({
+                users: {
+                    total: totalUsers,
+                    customers,
+                    vendors,
+                    admins,
+                    blocked: blockedUsers,
+                },
+                pizzas: {
+                    total: totalPizzas,
+                    pending: pendingPizzas,
+                    approved: approvedPizzas,
+                    rejected: rejectedPizzas,
+                    featured: featuredPizzas,
+                },
+                orders: {
+                    total: orderStats.total || 0,
+                    pending: orderStats.pending || 0,
+                    accepted: orderStats.accepted || 0,
+                    preparing: orderStats.preparing || 0,
+                    out_for_delivery: orderStats.out_for_delivery || 0,
+                    delivered: orderStats.delivered || 0,
+                    rejected: orderStats.rejected || 0,
+                    cancelled: orderStats.cancelled || 0,
+                    revenue: Number((orderStats.revenue || 0).toFixed(2)),
+                },
+                transactions: {
+                    total: transactionStats.total || 0,
+                    completedAmount: Number(
+                        (transactionStats.completedAmount || 0).toFixed(2)
+                    ),
+                },
+                monthlyOrders,
+            });
+        } catch (error) {
+            console.error("Fetch stats error:", error.message);
+
+            res.status(500).json({
+                message: "Failed to fetch statistics",
+            });
+        }
+    });
+
+    router.get("/transactions", requireAdmin, async (req, res) => {
+        try {
+            const parsedLimit = Number.parseInt(req.query.limit, 10);
+            const parsedSkip = Number.parseInt(req.query.skip, 10);
+
+            const limit =
+                Number.isFinite(parsedLimit) && parsedLimit > 0
+                    ? Math.min(parsedLimit, 100)
+                    : 50;
+            const skip =
+                Number.isFinite(parsedSkip) && parsedSkip > 0
+                    ? parsedSkip
+                    : 0;
+
+            const transactions = await transactionsCollection
+                .find({})
+                .sort({ createdAt: -1 })
+                .skip(skip)
+                .limit(limit)
+                .toArray();
+
+            res.status(200).json(transactions);
+        } catch (error) {
+            console.error("Fetch transactions error:", error.message);
+
+            res.status(500).json({
+                message: "Failed to fetch transactions",
+            });
+        }
+    });
 
     return router;
 }
