@@ -1,5 +1,31 @@
+import { jwt } from "better-auth/plugins";
 import { betterAuth } from "better-auth";
 import { mongodbAdapter } from "@better-auth/mongo-adapter";
+
+export const AUTH_BASE_PATH = "/api/auth";
+
+export function getJWTVerificationConfig() {
+    // Better Auth normalizes options.baseURL to its origin before the JWT
+    // plugin signs tokens, so iss/aud are the origin (not the raw env value).
+    const configuredURL = process.env.BETTER_AUTH_URL;
+
+    if (!configuredURL) {
+        throw new Error("BETTER_AUTH_URL is required for JWT verification");
+    }
+
+    let baseURL;
+    try {
+        baseURL = new URL(configuredURL).origin;
+    } catch {
+        throw new Error("BETTER_AUTH_URL must be a valid URL");
+    }
+
+    return {
+        jwksUrl: `${baseURL}${AUTH_BASE_PATH}/jwks`,
+        issuer: baseURL,
+        audience: baseURL,
+    };
+}
 
 const normalizeOrigin = (value) => {
     if (typeof value !== "string") {
@@ -38,11 +64,15 @@ export function getTrustedOrigins() {
 
 export function createAuth(db, client) {
     return betterAuth({
+        plugins: [
+            jwt(),
+        ],
         database: mongodbAdapter(db, {
             client,
         }),
 
         baseURL: process.env.BETTER_AUTH_URL,
+        basePath: AUTH_BASE_PATH,
         secret: process.env.BETTER_AUTH_SECRET,
 
         trustedOrigins: getTrustedOrigins(),

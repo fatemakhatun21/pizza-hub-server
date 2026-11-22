@@ -13,6 +13,11 @@ import createBillingRoutes from "./routes/billingRoutes.js";
 import createWishlistRoutes from "./routes/wishlistRoutes.js";
 import createReviewRoutes from "./routes/reviewRoutes.js";
 import { createAuth, getTrustedOrigins } from "./config/auth.js";
+import {
+    createJWTVerifier,
+    requireJWT,
+    withJWTSessions,
+} from "./middleware/verifyJWT.js";
 
 const configuredDnsServers = (process.env.DNS_SERVERS || "")
     .split(",")
@@ -64,7 +69,9 @@ async function startServer() {
 
         const db = client.db("pizzahub_db");
         const auth = createAuth(db, client);
-        const billing = createBillingRoutes(db, auth);
+        const jwtVerifier = createJWTVerifier();
+        const protectedAuth = withJWTSessions(auth, db, jwtVerifier);
+        const billing = createBillingRoutes(db, protectedAuth);
 
         app.all("/api/auth/*splat", toNodeHandler(auth));
 
@@ -79,7 +86,7 @@ async function startServer() {
 
         const verifySession = async (req, res, next) => {
             try {
-                const session = await auth.api.getSession({
+                const session = await protectedAuth.api.getSession({
                     headers: fromNodeHeaders(req.headers),
                 });
 
@@ -131,6 +138,14 @@ async function startServer() {
             role: user.role || "customer",
             plan: user.plan || "free",
             isPremium: user.plan === "premium",
+        });
+
+        // JWT-only endpoint for API clients. The browser app continues to use
+        // the cookie-backed /api/me routes below.
+        app.get("/api/jwt/me", requireJWT(jwtVerifier, db), (req, res) => {
+            return res.status(200).json({
+                user: toProfile(req.dbUser, req.user),
+            });
         });
 
         app.get("/api/me", verifySession, (req, res) => {
@@ -290,12 +305,12 @@ async function startServer() {
 
         const menuCollection = db.collection("menuItems");
 
-        app.use("/api/uploads", createUploadRoutes(db, auth));
-        app.use("/api/menu", createMenuRoutes(menuCollection, auth, db));
-        app.use("/api/admin", createAdminRoutes(db, auth));
-        app.use("/api/orders", createOrderRoutes(db, auth));
-        app.use("/api/wishlist", createWishlistRoutes(db, auth));
-        app.use("/api/reviews", createReviewRoutes(db, auth));
+        app.use("/api/uploads", createUploadRoutes(db, protectedAuth));
+        app.use("/api/menu", createMenuRoutes(menuCollection, protectedAuth, db));
+        app.use("/api/admin", createAdminRoutes(db, protectedAuth));
+        app.use("/api/orders", createOrderRoutes(db, protectedAuth));
+        app.use("/api/wishlist", createWishlistRoutes(db, protectedAuth));
+        app.use("/api/reviews", createReviewRoutes(db, protectedAuth));
         app.use("/api/billing", billing.router);
 
         app.get("/", (req, res) => {
