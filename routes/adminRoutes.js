@@ -1,8 +1,9 @@
 import { Router } from "express";
 import { ObjectId } from "mongodb";
 import { fromNodeHeaders } from "better-auth/node";
+import { withVendorItemLimit } from "../services/vendorItemLimit.js";
 
-export default function createAdminRoutes(db, auth) {
+export default function createAdminRoutes(db, auth, client) {
     const router = Router();
 
     const usersCollection = db.collection("user");
@@ -183,6 +184,7 @@ export default function createAdminRoutes(db, auth) {
                     });
                 }
 
+
                 if (status === "approved") {
                     const pizza = await menuCollection.findOne({
                         _id: new ObjectId(id),
@@ -201,32 +203,37 @@ export default function createAdminRoutes(db, auth) {
                         });
                     }
 
-                    const vendor = await usersCollection.findOne({
-                        _id: new ObjectId(pizza.vendorId),
-                        role: "vendor",
-                        blocked: { $ne: true },
+                    const outcome = await withVendorItemLimit({
+                        client,
+                        db,
+                        vendorId: pizza.vendorId,
+                        activating: true,
+                        mutate: async ({ session }) => {
+                            const result = await menuCollection.updateOne(
+                                {
+                                    _id: new ObjectId(id),
+                                    status: "pending",
+                                },
+                                {
+                                    $set: {
+                                        status: "approved",
+                                        isActive: true,
+                                        reviewedBy: req.user.id,
+                                        reviewedAt: new Date(),
+                                    },
+                                },
+                                { session }
+                            );
+
+                            return result.matchedCount
+                                ? { status: 200, message: "Pizza approved successfully" }
+                                : { status: 409, message: "Pizza no longer pending" };
+                        },
                     });
 
-                    if (!vendor) {
-                        return res.status(403).json({
-                            message: "Vendor account is unavailable",
-                        });
-                    }
-
-                    if (vendor.plan !== "premium") {
-                        const activeCount = await menuCollection.countDocuments({
-                            vendorId: pizza.vendorId,
-                            status: "approved",
-                            isActive: true,
-                        });
-
-                        if (activeCount >= 3) {
-                            return res.status(403).json({
-                                message:
-                                    "Free vendors can have a maximum of 3 active pizzas",
-                            });
-                        }
-                    }
+                    return res.status(outcome.status).json({
+                        message: outcome.message,
+                    });
                 }
 
                 const result = await menuCollection.updateOne(
@@ -237,7 +244,7 @@ export default function createAdminRoutes(db, auth) {
                     {
                         $set: {
                             status,
-                            isActive: status === "approved",
+                            isActive: false,
                             reviewedBy: req.user.id,
                             reviewedAt: new Date(),
                         },

@@ -68,10 +68,15 @@ const signToken = (claims = {}, options = {}) => {
 
 const tamper = (token) => {
     const parts = token.split(".");
-    const last = parts[2];
-    parts[2] = `${last.slice(0, -1)}${last.at(-1) === "A" ? "B" : "A"}`;
+    const signature = parts[2];
+
+    parts[2] =
+        (signature[0] === "A" ? "B" : "A") +
+        signature.slice(1);
+
     return parts.join(".");
 };
+
 
 const makeUser = (overrides = {}) => ({
     _id: new ObjectId(USER_ID),

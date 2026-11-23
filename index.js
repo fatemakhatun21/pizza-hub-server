@@ -306,8 +306,10 @@ async function startServer() {
         const menuCollection = db.collection("menuItems");
 
         app.use("/api/uploads", createUploadRoutes(db, protectedAuth));
-        app.use("/api/menu", createMenuRoutes(menuCollection, protectedAuth, db));
-        app.use("/api/admin", createAdminRoutes(db, protectedAuth));
+
+        app.use("/api/menu", createMenuRoutes(menuCollection, protectedAuth, db, client));
+        app.use("/api/admin", createAdminRoutes(db, protectedAuth, client));
+
         app.use("/api/orders", createOrderRoutes(db, protectedAuth));
         app.use("/api/wishlist", createWishlistRoutes(db, protectedAuth));
         app.use("/api/reviews", createReviewRoutes(db, protectedAuth));

@@ -1,8 +1,9 @@
 import { Router } from "express";
 import { ObjectId } from "mongodb";
 import { fromNodeHeaders } from "better-auth/node";
+import { withVendorItemLimit } from "../services/vendorItemLimit.js";
 
-export default function createMenuRoutes(menuCollection, auth, db) {
+export default function createMenuRoutes(menuCollection, auth, db, client) {
     const router = Router();
 
     const requireVendor = async (req, res, next) => {
@@ -10,7 +11,6 @@ export default function createMenuRoutes(menuCollection, auth, db) {
             const session = await auth.api.getSession({
                 headers: fromNodeHeaders(req.headers),
             });
-
             if (!session?.user) {
                 return res.status(401).json({
                     message: "Please sign in first",
@@ -215,6 +215,91 @@ export default function createMenuRoutes(menuCollection, auth, db) {
             });
         }
     });
+
+
+    router.patch("/:id/availability", requireVendor, async (req, res) => {
+        try {
+            const { id } = req.params;
+            const { isActive } = req.body ?? {};
+
+            if (!isValidId(id)) {
+                return res.status(400).json({
+                    message: "Invalid menu item ID",
+                });
+            }
+
+            if (typeof isActive !== "boolean") {
+                return res.status(400).json({
+                    message: "isActive must be true or false",
+                });
+            }
+
+            const filter = {
+                _id: new ObjectId(id),
+                vendorId: req.user.id,
+                status: "approved",
+            };
+
+            const pizza = await menuCollection.findOne(filter);
+
+            if (!pizza) {
+                return res.status(404).json({
+                    message: "Approved pizza not found or not owned by you",
+                });
+            }
+
+            if (pizza.isActive === isActive) {
+                return res.status(200).json({
+                    message: "Pizza availability is already up to date",
+                    isActive,
+                });
+            }
+
+            const outcome = await withVendorItemLimit({
+                client,
+                db,
+                vendorId: req.user.id,
+                activating: isActive,
+                mutate: async ({ session }) => {
+                    const result = await menuCollection.updateOne(
+                        {
+                            ...filter,
+                            isActive: !isActive,
+                        },
+                        {
+                            $set: {
+                                isActive,
+                                updatedAt: new Date(),
+                            },
+                        },
+                        { session }
+                    );
+
+                    return result.matchedCount
+                        ? {
+                            status: 200,
+                            message: isActive
+                                ? "Pizza is now available"
+                                : "Pizza is now unavailable",
+                            isActive,
+                        }
+                        : {
+                            status: 409,
+                            message: "Pizza availability changed. Please refresh.",
+                        };
+                },
+            });
+
+            return res.status(outcome.status).json(outcome);
+        } catch (error) {
+            console.error("Availability update error:", error.message);
+
+            return res.status(500).json({
+                message: "Failed to update availability",
+            });
+        }
+    });
+
 
     router.patch("/:id", requireVendor, async (req, res) => {
         try {
