@@ -2,6 +2,13 @@ import { Router } from "express";
 import { ObjectId } from "mongodb";
 import { fromNodeHeaders } from "better-auth/node";
 import { sendOrderStatusEmail } from "../services/emailService.js";
+import { PUBLIC_MENU_FILTER } from "../utils/menuFilters.js";
+import { isDuplicateKeyFor } from "../utils/mongoErrors.js";
+import {
+    ACTIVE_ORDER_STATUSES,
+    getDeliveryDateKey,
+    normalizeOrderMessage,
+} from "../utils/orderRules.js";
 
 export default function createOrderRoutes(db, auth) {
     const router = Router();
@@ -33,8 +40,8 @@ export default function createOrderRoutes(db, auth) {
             });
 
             if (!user || user.blocked === true) {
-                return res.status(401).json({
-                    message: "User not found",
+                return res.status(403).json({
+                    message: "Account unavailable or blocked",
                 });
             }
 
@@ -72,6 +79,8 @@ export default function createOrderRoutes(db, auth) {
                     quantity,
                     deliveryAddress,
                     deliveryDate,
+                    message,
+                    specialInstructions,
                 } = req.body ?? {};
 
                 if (!ObjectId.isValid(pizzaId)) {
@@ -111,10 +120,27 @@ export default function createOrderRoutes(db, auth) {
                     });
                 }
 
+                const messageResult = normalizeOrderMessage(
+                    message ?? specialInstructions
+                );
+
+                if (!messageResult.ok) {
+                    return res.status(400).json({
+                        message: messageResult.message,
+                    });
+                }
+
+                const deliveryDateKey = getDeliveryDateKey(deliveryDate);
+
+                if (!deliveryDateKey) {
+                    return res.status(400).json({
+                        message: "Choose a valid delivery date",
+                    });
+                }
+
                 const pizza = await menuItems.findOne({
+                    ...PUBLIC_MENU_FILTER,
                     _id: new ObjectId(pizzaId),
-                    status: "approved",
-                    isActive: true,
                 });
 
                 if (!pizza || !pizza.vendorId) {
@@ -123,15 +149,24 @@ export default function createOrderRoutes(db, auth) {
                     });
                 }
 
+                if (String(pizza.vendorId) === String(req.user.id)) {
+                    return res.status(403).json({
+                        message: "Vendors cannot order their own pizzas",
+                    });
+                }
+
+                const canonicalPizzaId = pizza._id.toString();
                 const existingOrder = await orders.findOne({
                     customerId: req.user.id,
-                    pizzaId: pizza._id.toString(),
-                    status: "pending",
+                    pizzaId: canonicalPizzaId,
+                    deliveryDateKey,
+                    status: { $in: ACTIVE_ORDER_STATUSES },
                 });
 
                 if (existingOrder) {
                     return res.status(409).json({
-                        message: "You already have a pending order for this pizza",
+                        message:
+                            "You already have an active order for this pizza on that delivery date",
                     });
                 }
 
@@ -141,7 +176,8 @@ export default function createOrderRoutes(db, auth) {
                     customerEmail: req.user.email,
 
                     vendorId: pizza.vendorId,
-                    pizzaId: pizza._id.toString(),
+                    vendorName: pizza.vendorName || pizza.vendor || "",
+                    pizzaId: canonicalPizzaId,
                     pizzaName: pizza.name,
                     pizzaImage: pizza.image,
 
@@ -153,6 +189,8 @@ export default function createOrderRoutes(db, auth) {
 
                     deliveryAddress: deliveryAddress.trim(),
                     deliveryDate: date,
+                    deliveryDateKey,
+                    message: messageResult.value,
 
                     status: "pending",
                     timeline: [
@@ -166,7 +204,29 @@ export default function createOrderRoutes(db, auth) {
                     updatedAt: new Date(),
                 };
 
-                const result = await orders.insertOne(order);
+                let result;
+
+                try {
+                    result = await orders.insertOne(order);
+                } catch (error) {
+                    // The partial unique index is the authoritative guard.
+                    // This catch only converts its race outcome into the same
+                    // 409 response as the pre-check above.
+                    if (
+                        isDuplicateKeyFor(error, [
+                            "customerId",
+                            "pizzaId",
+                            "deliveryDateKey",
+                        ])
+                    ) {
+                        return res.status(409).json({
+                            message:
+                                "You already have an active order for this pizza on that delivery date",
+                        });
+                    }
+
+                    throw error;
+                }
 
                 res.status(201).json({
                     message: "Order placed successfully",

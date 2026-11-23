@@ -81,7 +81,7 @@ export function withJWTSessions(auth, db, verifyJWT) {
                             _id: new ObjectId(payload.sub),
                         });
 
-                        if (!user) return null;
+                        if (!user || user.blocked === true) return null;
 
                         const id = String(user._id);
 

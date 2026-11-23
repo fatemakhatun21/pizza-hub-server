@@ -6,7 +6,9 @@
   "scripts": {
     "start": "node index.js",
     "dev": "nodemon index.js",
-    "test": "node --test"
+    "test": "node --test",
+    "indexes:verify": "node scripts/verifyIndexes.js",
+    "indexes:create": "node scripts/createIndexes.js"
   },
   "keywords": [],
   "author": "",

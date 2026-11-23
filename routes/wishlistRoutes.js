@@ -1,6 +1,8 @@
 import { Router } from "express";
 import { ObjectId } from "mongodb";
 import { fromNodeHeaders } from "better-auth/node";
+import { PUBLIC_MENU_FILTER } from "../utils/menuFilters.js";
+import { isDuplicateKeyError } from "../utils/mongoErrors.js";
 
 export default function createWishlistRoutes(db, auth) {
     const router = Router();
@@ -52,6 +54,16 @@ export default function createWishlistRoutes(db, auth) {
         }
     };
 
+    const requireCustomer = (req, res, next) => {
+        if (req.user.role !== "customer") {
+            return res.status(403).json({
+                message: "Only customers can access this resource",
+            });
+        }
+
+        return next();
+    };
+
     const isValidId = (id) => {
         if (typeof id !== "string") {
             return false;
@@ -63,7 +75,7 @@ export default function createWishlistRoutes(db, auth) {
         );
     };
 
-    router.get("/", requireAuth, async (req, res) => {
+    router.get("/", requireAuth, requireCustomer, async (req, res) => {
         try {
             const entries = await wishlist
                 .find({ customerId: req.user.id })
@@ -81,9 +93,8 @@ export default function createWishlistRoutes(db, auth) {
 
             const pizzas = await menuItems
                 .find({
+                    ...PUBLIC_MENU_FILTER,
                     _id: { $in: pizzaIds },
-                    status: "approved",
-                    isActive: true,
                 })
                 .toArray();
 
@@ -91,7 +102,20 @@ export default function createWishlistRoutes(db, auth) {
                 pizzas.map((pizza) => [pizza._id.toString(), pizza])
             );
 
+            const seenPizzaIds = new Set();
+
             const items = entries
+                .filter((entry) => {
+                    const key = String(entry.pizzaId);
+
+                    if (seenPizzaIds.has(key)) {
+                        return false;
+                    }
+
+                    seenPizzaIds.add(key);
+
+                    return true;
+                })
                 .map((entry) => pizzasById.get(String(entry.pizzaId)))
                 .filter(Boolean);
 
@@ -105,7 +129,7 @@ export default function createWishlistRoutes(db, auth) {
         }
     });
 
-    router.post("/", requireAuth, async (req, res) => {
+    router.post("/", requireAuth, requireCustomer, async (req, res) => {
         try {
             const { pizzaId } = req.body ?? {};
 
@@ -116,9 +140,8 @@ export default function createWishlistRoutes(db, auth) {
             }
 
             const pizza = await menuItems.findOne({
+                ...PUBLIC_MENU_FILTER,
                 _id: new ObjectId(pizzaId),
-                status: "approved",
-                isActive: true,
             });
 
             if (!pizza) {
@@ -127,20 +150,29 @@ export default function createWishlistRoutes(db, auth) {
                 });
             }
 
-            await wishlist.updateOne(
-                {
-                    customerId: req.user.id,
-                    pizzaId: new ObjectId(pizzaId),
-                },
-                {
-                    $setOnInsert: {
+            try {
+                await wishlist.updateOne(
+                    {
                         customerId: req.user.id,
                         pizzaId: new ObjectId(pizzaId),
-                        createdAt: new Date(),
                     },
-                },
-                { upsert: true }
-            );
+                    {
+                        $setOnInsert: {
+                            customerId: req.user.id,
+                            pizzaId: new ObjectId(pizzaId),
+                            createdAt: new Date(),
+                        },
+                    },
+                    { upsert: true }
+                );
+            } catch (error) {
+                // A concurrent upsert can lose the unique-index race. The
+                // requested item is still present, so keep the endpoint
+                // idempotent instead of surfacing a 500.
+                if (!isDuplicateKeyError(error)) {
+                    throw error;
+                }
+            }
 
             res.status(200).json({
                 message: "Added to wishlist",
@@ -154,7 +186,7 @@ export default function createWishlistRoutes(db, auth) {
         }
     });
 
-    router.delete("/:pizzaId", requireAuth, async (req, res) => {
+    router.delete("/:pizzaId", requireAuth, requireCustomer, async (req, res) => {
         try {
             const { pizzaId } = req.params;
 

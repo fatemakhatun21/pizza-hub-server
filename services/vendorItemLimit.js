@@ -1,5 +1,6 @@
 
 import { ObjectId } from "mongodb";
+import { isPremium } from "./premiumStatus.js";
 
 export async function withVendorItemLimit({
     client,
@@ -34,7 +35,7 @@ export async function withVendorItemLimit({
                 };
             }
 
-            if (activating && vendor.plan !== "premium") {
+            if (activating && !isPremium(vendor)) {
                 const activeCount = await db
                     .collection("menuItems")
                     .countDocuments(
@@ -42,6 +43,8 @@ export async function withVendorItemLimit({
                             vendorId,
                             status: "approved",
                             isActive: true,
+                            isDeleted: { $ne: true },
+                            adminPublished: { $ne: false },
                         },
                         { session }
                     );

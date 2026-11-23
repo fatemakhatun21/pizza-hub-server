@@ -2,6 +2,7 @@ import { Router } from "express";
 import { ObjectId } from "mongodb";
 import { fromNodeHeaders } from "better-auth/node";
 import { isValidObjectId, validateReviewInput } from "../utils/validators.js";
+import { PUBLIC_MENU_FILTER } from "../utils/menuFilters.js";
 
 const EMPTY_REVIEW_SUMMARY = {
     averageRating: 0,
@@ -47,15 +48,9 @@ export default function createReviewRoutes(db, auth) {
         }
     };
 
-    // One review per customer per pizza, including under concurrent requests.
-    reviews
-        .createIndex(
-            { customerId: 1, pizzaId: 1 },
-            { unique: true, name: "customerId_1_pizzaId_1" }
-        )
-        .catch((error) =>
-            console.error("Reviews index error:", error.message)
-        );
+    // The unique review constraint is defined once in services/dbIndexes.js
+    // and pre-created by the documented deployment procedure. Creating it here
+    // with a second name caused IndexOptionsConflict on existing deployments.
 
     const requireAuth = async (req, res, next) => {
         try {
@@ -114,9 +109,8 @@ export default function createReviewRoutes(db, auth) {
             }
 
             const pizza = await menuItems.findOne({
+                ...PUBLIC_MENU_FILTER,
                 _id: new ObjectId(pizzaId),
-                status: "approved",
-                isActive: true,
             });
 
             if (!pizza) {
@@ -185,9 +179,8 @@ export default function createReviewRoutes(db, auth) {
             const pizzaObjectId = new ObjectId(pizzaId);
 
             const pizza = await menuItems.findOne({
+                ...PUBLIC_MENU_FILTER,
                 _id: pizzaObjectId,
-                status: "approved",
-                isActive: true,
             });
 
             if (!pizza) {

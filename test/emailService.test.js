@@ -54,7 +54,7 @@ test("buildOrderStatusEmail returns subject, text and html for accepted and reje
     assert.match(accepted.text, /Margherita/);
     assert.match(
         accepted.text,
-        /https:\/\/pizzahub\.example\/order\/order-123/
+        /https:\/\/pizzahub\.example\/customer\/dashboard\?orderId=order-123/
     );
     assert.match(accepted.html, /<a href=/);
 

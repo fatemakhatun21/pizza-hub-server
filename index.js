@@ -13,11 +13,18 @@ import createBillingRoutes from "./routes/billingRoutes.js";
 import createWishlistRoutes from "./routes/wishlistRoutes.js";
 import createReviewRoutes from "./routes/reviewRoutes.js";
 import { createAuth, getTrustedOrigins } from "./config/auth.js";
+import { verifyRequiredIndexes } from "./services/dbIndexes.js";
+import { isPremium } from "./services/premiumStatus.js";
 import {
     createJWTVerifier,
     requireJWT,
     withJWTSessions,
 } from "./middleware/verifyJWT.js";
+import {
+    readSignupBody,
+    requireStrongSignupPassword,
+} from "./middleware/signupPassword.js";
+import { apiNotFound } from "./middleware/apiNotFound.js";
 
 const configuredDnsServers = (process.env.DNS_SERVERS || "")
     .split(",")
@@ -68,10 +75,25 @@ async function startServer() {
         console.log("MongoDB Connected Successfully!");
 
         const db = client.db("pizzahub_db");
+
+        // Index builds are intentionally not part of app startup. This is a
+        // read-only check only: production fails closed if a required unique
+        // index is missing, while non-production logs a warning.
+        await verifyRequiredIndexes(db, console);
+
         const auth = createAuth(db, client);
         const jwtVerifier = createJWTVerifier();
         const protectedAuth = withJWTSessions(auth, db, jwtVerifier);
         const billing = createBillingRoutes(db, protectedAuth);
+
+        // Enforce the public sign-up password rule before Better Auth receives
+        // the request. Existing credential hashes are untouched on sign-in.
+        app.post(
+            "/api/auth/sign-up/email",
+            readSignupBody,
+            requireStrongSignupPassword,
+            toNodeHandler(auth)
+        );
 
         app.all("/api/auth/*splat", toNodeHandler(auth));
 
@@ -130,15 +152,21 @@ async function startServer() {
             }
         };
 
-        const toProfile = (user, sessionUser = {}) => ({
-            id: user._id.toString(),
-            name: user.name ?? sessionUser.name ?? "",
-            email: user.email ?? sessionUser.email ?? "",
-            image: user.image ?? sessionUser.image ?? null,
-            role: user.role || "customer",
-            plan: user.plan || "free",
-            isPremium: user.plan === "premium",
-        });
+        const toProfile = (user, sessionUser = {}) => {
+            const premium = isPremium(user);
+
+            return {
+                id: user._id.toString(),
+                name: user.name ?? sessionUser.name ?? "",
+                email: user.email ?? sessionUser.email ?? "",
+                image: user.image ?? sessionUser.image ?? null,
+                role: user.role || "customer",
+                // Report the effective plan so expired subscriptions cannot be
+                // treated as Premium through the legacy plan string in the UI.
+                plan: premium ? "premium" : "free",
+                isPremium: premium,
+            };
+        };
 
         // JWT-only endpoint for API clients. The browser app continues to use
         // the cookie-backed /api/me routes below.
@@ -318,6 +346,8 @@ async function startServer() {
         app.get("/", (req, res) => {
             res.send("PizzaHub Server is Running!");
         });
+
+        app.use("/api", apiNotFound);
 
         app.listen(port, () => {
             console.log(`PizzaHub Server running on port ${port}`);

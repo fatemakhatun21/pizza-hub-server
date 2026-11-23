@@ -2,9 +2,115 @@ import { Router } from "express";
 import { ObjectId } from "mongodb";
 import { fromNodeHeaders } from "better-auth/node";
 import { withVendorItemLimit } from "../services/vendorItemLimit.js";
+import { isPremium } from "../services/premiumStatus.js";
+import {
+    NOT_DELETED_FILTER,
+    PUBLIC_MENU_FILTER,
+} from "../utils/menuFilters.js";
+import {
+    normalizeMenuImages,
+    withMenuImages,
+} from "../utils/menuImages.js";
+
+const CATEGORY_ALIASES = {
+    // Legacy menu items used the longer gourmet label. The UI now uses one
+    // canonical category while queries still find older documents.
+    "Specialty Pizzas": ["Specialty Pizzas", "Specialty / Gourmet Pizzas"],
+};
+
+const firstQueryValue = (value) => {
+    if (Array.isArray(value)) {
+        return firstQueryValue(value[0]);
+    }
+
+    return typeof value === "string" ? value : null;
+};
+
+const escapeRegex = (value) =>
+    value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+const parsePrice = (value) => {
+    const raw = firstQueryValue(value);
+
+    if (raw === null || raw.trim() === "") {
+        return null;
+    }
+
+    const parsed = Number(raw);
+
+    return Number.isFinite(parsed) ? parsed : null;
+};
+
+const getMenuSort = (value) => {
+    switch (firstQueryValue(value)?.toLowerCase()) {
+        case "low":
+        case "asc":
+        case "price_asc":
+            return { price: 1, createdAt: -1 };
+        case "high":
+        case "desc":
+        case "price_desc":
+            return { price: -1, createdAt: -1 };
+        case "newest":
+            return { createdAt: -1 };
+        default:
+            return { isFeatured: -1, createdAt: -1 };
+    }
+};
 
 export default function createMenuRoutes(menuCollection, auth, db, client) {
     const router = Router();
+    const usersCollection = db.collection("user");
+
+    const attachVendorPlan = async (items) => {
+        const list = Array.isArray(items) ? items : [items];
+        const vendorIds = [
+            ...new Set(
+                list
+                    .map((item) => item?.vendorId)
+                    .filter((id) => id != null && ObjectId.isValid(id))
+                    .map((id) => String(id))
+            ),
+        ];
+
+        const premiumByVendor = new Map();
+
+        await Promise.all(
+            vendorIds.map(async (vendorId) => {
+                const vendor = await usersCollection.findOne(
+                    { _id: new ObjectId(vendorId) },
+                    {
+                        projection: {
+                            plan: 1,
+                            isPremium: 1,
+                            premiumExpiresAt: 1,
+                        },
+                    }
+                );
+
+                premiumByVendor.set(vendorId, isPremium(vendor));
+            })
+        );
+
+        const decorate = (item) => {
+            if (!item || typeof item !== "object") {
+                return item;
+            }
+
+            const vendorIsPremium =
+                premiumByVendor.get(String(item.vendorId)) ?? false;
+
+            return withMenuImages({
+                ...item,
+                vendorIsPremium,
+                vendorPlan: vendorIsPremium ? "premium" : "free",
+            });
+        };
+
+        return Array.isArray(items)
+            ? items.map(decorate)
+            : decorate(items);
+    };
 
     const requireVendor = async (req, res, next) => {
         try {
@@ -47,17 +153,104 @@ export default function createMenuRoutes(menuCollection, auth, db, client) {
     const isValidText = (value) =>
         typeof value === "string" && value.trim().length > 0;
 
+    const requireAuth = async (req, res, next) => {
+        try {
+            const session = await auth.api.getSession({
+                headers: fromNodeHeaders(req.headers),
+            });
+
+            if (!session?.user) {
+                return res.status(401).json({
+                    message: "Please sign in first",
+                });
+            }
+
+            if (!ObjectId.isValid(session.user.id)) {
+                return res.status(401).json({
+                    message: "Invalid session",
+                });
+            }
+
+            const user = await db.collection("user").findOne({
+                _id: new ObjectId(session.user.id),
+            });
+
+            if (!user || user.blocked === true) {
+                return res.status(403).json({
+                    message: "Account unavailable or blocked",
+                });
+            }
+
+            req.user = {
+                ...user,
+                id: session.user.id,
+            };
+
+            return next();
+        } catch (error) {
+            console.error("Menu authorization error:", error.message);
+
+            return res.status(500).json({
+                message: "Unable to verify permission",
+            });
+        }
+    };
+
     router.get("/", async (req, res) => {
         try {
+            const query = { ...PUBLIC_MENU_FILTER };
+
+            const search =
+                firstQueryValue(req.query.search) ??
+                firstQueryValue(req.query.q);
+            const trimmedSearch = search?.trim();
+
+            if (trimmedSearch) {
+                query.name = {
+                    $regex: escapeRegex(trimmedSearch),
+                    $options: "i",
+                };
+            }
+
+            const category = firstQueryValue(req.query.category);
+
+            if (category && category !== "All Categories") {
+                query.category = CATEGORY_ALIASES[category]
+                    ? { $in: CATEGORY_ALIASES[category] }
+                    : category;
+            }
+
+            const location = firstQueryValue(req.query.location);
+
+            if (location && location !== "All Locations") {
+                query.location = location;
+            }
+
+            const minPrice =
+                parsePrice(req.query.minPrice) ??
+                parsePrice(req.query.priceMin);
+            const maxPrice =
+                parsePrice(req.query.maxPrice) ??
+                parsePrice(req.query.priceMax);
+
+            if (minPrice !== null || maxPrice !== null) {
+                query.price = {};
+
+                if (minPrice !== null) {
+                    query.price.$gte = minPrice;
+                }
+
+                if (maxPrice !== null) {
+                    query.price.$lte = maxPrice;
+                }
+            }
+
             const items = await menuCollection
-                .find({
-                    status: "approved",
-                    isActive: true,
-                })
-                .sort({ isFeatured: -1, createdAt: -1 })
+                .find(query)
+                .sort(getMenuSort(req.query.sort))
                 .toArray();
 
-            res.status(200).json(items);
+            res.status(200).json(await attachVendorPlan(items));
         } catch (error) {
             console.error("Menu fetch error:", error.message);
             res.status(500).json({
@@ -75,17 +268,22 @@ export default function createMenuRoutes(menuCollection, auth, db, client) {
                 price,
                 location,
                 image,
+                images,
             } = req.body ?? {};
 
+            const imageResult = normalizeMenuImages({ image, images });
+
             if (
-                ![name, description, category, location, image]
-                    .every(isValidText) ||
+                ![name, description, category, location].every(isValidText) ||
+                !imageResult.ok ||
                 typeof price !== "number" ||
                 !Number.isFinite(price) ||
                 price <= 0
             ) {
                 return res.status(400).json({
-                    message: "Valid menu item information is required",
+                    message: imageResult.ok
+                        ? "Valid menu item information is required"
+                        : imageResult.message,
                 });
             }
 
@@ -95,14 +293,17 @@ export default function createMenuRoutes(menuCollection, auth, db, client) {
                 category: category.trim(),
                 price,
                 location: location.trim(),
-                image: image.trim(),
+                image: imageResult.images[0],
+                images: imageResult.images,
 
                 vendorId: req.user.id,
                 vendor: req.user.name,
 
                 status: "pending",
                 isActive: false,
+                adminPublished: true,
                 isFeatured: false,
+                isDeleted: false,
                 createdAt: new Date(),
             };
 
@@ -124,11 +325,11 @@ export default function createMenuRoutes(menuCollection, auth, db, client) {
     router.get("/vendor/mine", requireVendor, async (req, res) => {
         try {
             const items = await menuCollection
-                .find({ vendorId: req.user.id })
+                .find({ ...NOT_DELETED_FILTER, vendorId: req.user.id })
                 .sort({ createdAt: -1 })
                 .toArray();
 
-            res.status(200).json(items);
+            res.status(200).json(items.map(withMenuImages));
         } catch (error) {
             console.error("Vendor menu error:", error.message);
 
@@ -146,10 +347,7 @@ export default function createMenuRoutes(menuCollection, auth, db, client) {
                     ? Math.min(parsedLimit, 12)
                     : 6;
 
-            const baseQuery = {
-                status: "approved",
-                isActive: true,
-            };
+            const baseQuery = { ...PUBLIC_MENU_FILTER };
 
             const featured = await menuCollection
                 .find({
@@ -175,7 +373,7 @@ export default function createMenuRoutes(menuCollection, auth, db, client) {
                 items = [...featured, ...fillers];
             }
 
-            res.status(200).json(items);
+            res.status(200).json(await attachVendorPlan(items));
         } catch (error) {
             console.error("Featured menu fetch error:", error.message);
 
@@ -185,7 +383,7 @@ export default function createMenuRoutes(menuCollection, auth, db, client) {
         }
     });
 
-    router.get("/:id", async (req, res) => {
+    router.get("/:id", requireAuth, async (req, res) => {
         try {
             const { id } = req.params;
 
@@ -196,9 +394,8 @@ export default function createMenuRoutes(menuCollection, auth, db, client) {
             }
 
             const item = await menuCollection.findOne({
+                ...PUBLIC_MENU_FILTER,
                 _id: new ObjectId(id),
-                status: "approved",
-                isActive: true,
             });
 
             if (!item) {
@@ -207,7 +404,7 @@ export default function createMenuRoutes(menuCollection, auth, db, client) {
                 });
             }
 
-            res.status(200).json(item);
+            res.status(200).json(await attachVendorPlan(item));
         } catch (error) {
             console.error("Single menu fetch error:", error.message);
             res.status(500).json({
@@ -235,6 +432,7 @@ export default function createMenuRoutes(menuCollection, auth, db, client) {
             }
 
             const filter = {
+                ...NOT_DELETED_FILTER,
                 _id: new ObjectId(id),
                 vendorId: req.user.id,
                 status: "approved",
@@ -312,6 +510,7 @@ export default function createMenuRoutes(menuCollection, auth, db, client) {
             }
 
             const existingItem = await menuCollection.findOne({
+                ...NOT_DELETED_FILTER,
                 _id: new ObjectId(id),
             });
 
@@ -333,16 +532,20 @@ export default function createMenuRoutes(menuCollection, auth, db, client) {
                 "category",
                 "price",
                 "location",
-                "image",
             ];
+            const hasImageUpdate =
+                Object.prototype.hasOwnProperty.call(body, "image") ||
+                Object.prototype.hasOwnProperty.call(body, "images");
 
             const hasFeaturedUpdate = Object.prototype.hasOwnProperty.call(
                 body,
                 "isFeatured"
             );
-            const hasOtherUpdates = editableFields.some((key) =>
-                Object.prototype.hasOwnProperty.call(body, key)
-            );
+            const hasOtherUpdates =
+                hasImageUpdate ||
+                editableFields.some((key) =>
+                    Object.prototype.hasOwnProperty.call(body, key)
+                );
 
             if (!hasFeaturedUpdate && !hasOtherUpdates) {
                 return res.status(400).json({
@@ -351,7 +554,7 @@ export default function createMenuRoutes(menuCollection, auth, db, client) {
             }
 
             if (hasFeaturedUpdate) {
-                if (req.user.plan !== "premium") {
+                if (!isPremium(req.user)) {
                     return res.status(403).json({
                         message: "Only premium vendors can feature pizzas",
                     });
@@ -372,12 +575,25 @@ export default function createMenuRoutes(menuCollection, auth, db, client) {
                 }
             }
 
+            if (hasImageUpdate) {
+                const imageResult = normalizeMenuImages(body);
+
+                if (!imageResult.ok) {
+                    return res.status(400).json({
+                        message: imageResult.message,
+                    });
+                }
+
+                updates.image = imageResult.images[0];
+                updates.images = imageResult.images;
+            }
+
             if (hasFeaturedUpdate) {
                 updates.isFeatured = body.isFeatured;
             }
 
             for (const [key, value] of Object.entries(updates)) {
-                if (key === "isFeatured") {
+                if (key === "isFeatured" || key === "image" || key === "images") {
                     continue;
                 }
 
@@ -409,6 +625,7 @@ export default function createMenuRoutes(menuCollection, auth, db, client) {
 
             const result = await menuCollection.updateOne(
                 {
+                    ...NOT_DELETED_FILTER,
                     _id: new ObjectId(id),
                     vendorId: req.user.id,
                 },
@@ -446,14 +663,33 @@ export default function createMenuRoutes(menuCollection, auth, db, client) {
                 });
             }
 
-            const result = await menuCollection.deleteOne({
+            const filter = {
+                ...NOT_DELETED_FILTER,
                 _id: new ObjectId(id),
                 vendorId: req.user.id,
-            });
+            };
 
-            if (result.deletedCount === 0) {
+            const pizza = await menuCollection.findOne(filter);
+
+            if (!pizza) {
                 return res.status(404).json({
                     message: "Pizza not found or not owned by you",
+                });
+            }
+
+            const result = await menuCollection.updateOne(filter, {
+                $set: {
+                    isActive: false,
+                    isDeleted: true,
+                    deletedAt: new Date(),
+                    deletedBy: req.user.id,
+                    updatedAt: new Date(),
+                },
+            });
+
+            if (result.matchedCount === 0) {
+                return res.status(409).json({
+                    message: "Pizza availability changed. Please refresh.",
                 });
             }
 

@@ -221,6 +221,21 @@ test("withJWTSessions maps invalid Bearer tokens to a missing session", async ()
     }
 });
 
+test("withJWTSessions rejects blocked users for Bearer JWTs", async () => {
+    const verifier = makeVerifier();
+    const wrapped = withJWTSessions(
+        makeAuth(null),
+        makeDb(makeUser({ blocked: true })),
+        verifier
+    );
+
+    const session = await wrapped.api.getSession({
+        headers: headersWith(`Bearer ${await signToken()}`),
+    });
+
+    assert.equal(session, null);
+});
+
 test("requireJWT rejects missing, malformed, and invalid credentials with 401", async () => {
     const guard = requireJWT(makeVerifier(), makeDb(makeUser()));
     const cases = [

@@ -50,7 +50,7 @@ Built with **Node.js, Express.js, MongoDB Atlas, and Better Auth**, the API mana
 ## 👥 User Roles
 
 ### Customer
-Customers can browse approved items, place orders, track order statuses, cancel eligible orders, manage wishlists, and submit reviews.
+Customers can browse approved item lists, place orders, track order statuses, cancel eligible orders, manage wishlists, and submit reviews. Viewing a single item's details requires signing in.
 
 ### Vendor
 Vendors can manage their own menu items, upload images, control availability, view customer orders, and accept or reject pending orders.
@@ -97,11 +97,16 @@ JWT functionality uses Better Auth's JWT support with JOSE-based verification. T
 
 ### Menu Items
 
-Menu management endpoints are available under:
+Menu endpoints are available under `/api/menu`.
 
-`/api/menu`
+| Method | Endpoint | Access | Description |
+|---|---|---|---|
+| GET | `/api/menu` | Public | Browse approved, active items with search/filter/sort |
+| GET | `/api/menu/featured` | Public | Browse featured approved, active items |
+| GET | `/api/menu/:id` | Authenticated | View a single approved, active item |
+| POST / PATCH / DELETE | `/api/menu/...` | Vendor | Create, edit, delete, or change availability of own items |
 
-These support public browsing, filtering, featured items, and vendor menu management.
+Vendor management requires the `vendor` role.
 
 ### Orders
 
@@ -142,15 +147,36 @@ Supports authenticated image uploads through ImgBB.
 
 ### Advanced Search and Sorting
 
-The menu API supports filtering by item name, category, and location, along with ascending and descending price sorting.
+`GET /api/menu` accepts these query parameters:
 
-This allows the frontend to request relevant approved and active menu items.
+| Parameter | Example | Purpose |
+|---|---|---|
+| `search` / `q` | `pepperoni` | Case-insensitive item-name search |
+| `category` | `Classic Pizzas` | Category filter; legacy gourmet aliases are translated |
+| `location` | `Dhanmondi` | Location filter |
+| `minPrice` / `priceMin` | `10` | Minimum price |
+| `maxPrice` / `priceMax` | `20` | Maximum price |
+| `sort` | `price_asc`, `price_desc`, `newest` | Price sorting or newest-first |
+
+`GET /api/admin/menu` accepts `search`, `status`, `category`, `location`, and `sort` for admin-side filtering. All parameters are normalized server-side and applied only to approved/active public items for the public endpoint.
 
 ### JWT Verification
 
-Better Auth manages authentication and provides JWT functionality. JWT verification middleware validates signed tokens through the configured signing keys and rejects invalid or expired tokens.
+Better Auth's JWT plugin issues tokens. Protected API clients send `Authorization: Bearer <token>`; `createJWTVerifier()` discovers the JWKS from `${BETTER_AUTH_URL}/api/auth/jwks`, then `requireJWT()` verifies the signature, `iss`, `aud`, expiration, and blocked status before loading the current database user. `withJWTSessions()` maps eligible Bearer requests into Better Auth-compatible sessions while browser cookie sessions continue through `/api/me`. Role middleware then returns `401` for unauthenticated requests and `403` for forbidden roles. Invalid, expired, or wrong-issuer tokens never reach route handlers.
 
-Backend authorization separately checks user roles, blocked status, and resource ownership.
+### Safe Admin Provisioning
+
+Public registration always forces `role: "customer"`; the role field is not client-writable. After a trusted admin has signed in once, promote that account directly in the database during a controlled maintenance window:
+
+```javascript
+const appDb = db.getSiblingDB("pizzahub_db");
+appDb.user.updateOne(
+  { email: "admin@example.com" },
+  { $set: { role: "admin", blocked: false, updatedAt: new Date() } }
+);
+```
+
+Never create admin accounts from the public registration endpoint, never commit admin credentials, and verify the promoted account through `/api/me` before granting access.
 
 ### Professional UI/UX
 
@@ -236,7 +262,7 @@ Run the backend tests:
 npm test
 ```
 
-The test suite covers authentication, authorization, and application business rules.
+The test suite covers authentication, authorization, and application business rules. The MongoDB-backed concurrency test is skipped unless `TEST_MONGODB_URI` is set (test-only; see `.env.example`). Stripe webhook tests use mocked payloads and do not create real payments.
 
 ## 💳 Stripe Subscription Flow
 
@@ -258,7 +284,7 @@ The backend is hosted on **Render**, with MongoDB Atlas as the database.
 | Setting | Value |
 |---|---|
 | Runtime | Node.js |
-| Build Command | `npm ci` |
+| Build Command | `npm install` |
 | Start Command | `npm start` |
 | Health Check Path | `/health` |
 | Branch | `main` |
@@ -281,11 +307,29 @@ Configure the Stripe webhook destination as:
 https://pizza-hub-server.onrender.com/api/billing/webhook
 ```
 
-Ensure the webhook signing secret is configured securely in Render.
+Ensure the webhook signing secret is configured securely in Render. Enable only
+`checkout.session.completed`, `customer.subscription.updated`,
+`customer.subscription.deleted`, and `invoice.payment_failed` on that endpoint.
+
+### Database indexes
+
+The app never creates indexes at boot. Production startup only performs a
+read-only verification and fails if a critical index is missing. Before the
+first production deployment, follow `DEPLOYMENT.md` to run the read-only checks
+and then, during a controlled maintenance window, run:
+
+```bash
+npm run indexes:verify
+CONFIRM_INDEX_CREATE=yes npm run indexes:create
+```
+
+The creation script re-runs duplicate/type checks and aborts before writing
+indexes if any conflict exists. It is an explicit operator command, not part of
+startup or tests.
 
 ## 📌 Important Notes
 
-- Menu items must be approved before appearing publicly.
+- Approved, active items appear in public menu lists; single-item details require authentication.
 - Only approved and active menu items can be ordered.
 - Vendors may manage only their own resources.
 - Only pending orders can be accepted or rejected.
@@ -295,3 +339,15 @@ Ensure the webhook signing secret is configured securely in Render.
 ## 👩‍💻 Author
 
 Developed as a full-stack web development assignment.
+
+### Active-order uniqueness (important migration note)
+
+The required `orders_unique_active_customer_pizza_date` unique partial index
+uses `{ status: { $in: ["pending", "accepted", "preparing", "out_for_delivery"] } }` so all in-progress
+orders **share the same uniqueness constraint** for each customer, pizza, and
+canonical UTC delivery date. Separate per-status indexes do not enforce this.
+The server derives `deliveryDateKey` from `deliveryDate`; it never trusts a
+client-supplied date key. Before deploying, backfill older active orders,
+check duplicates across *all active* statuses, create the combined index and retire
+legacy order unique indexes through an operator-approved migration.
+Never run production index changes automatically.

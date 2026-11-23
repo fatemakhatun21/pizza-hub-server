@@ -2,6 +2,65 @@ import { Router } from "express";
 import { ObjectId } from "mongodb";
 import { fromNodeHeaders } from "better-auth/node";
 import { withVendorItemLimit } from "../services/vendorItemLimit.js";
+import {
+    NOT_DELETED_FILTER,
+    PUBLIC_MENU_FILTER,
+} from "../utils/menuFilters.js";
+
+// Only settled, fulfilled orders represent earned revenue. Pending may still
+// be rejected, and rejected/cancelled orders must never inflate revenue.
+const REVENUE_ORDER_STATUSES = [
+    "accepted",
+    "preparing",
+    "out_for_delivery",
+    "delivered",
+];
+
+// Pending items are reviewed first. Published items can later be taken down
+// or restored; adminPublished remains a separate visibility flag.
+const MENU_STATUS_TRANSITIONS = {
+    pending: ["approved", "rejected"],
+    approved: ["inactive", "rejected"],
+    rejected: ["approved"],
+    inactive: ["approved"],
+};
+
+const firstValue = (value) =>
+    Array.isArray(value) ? firstValue(value[0]) : value;
+
+const transactionVendorId = (transaction) =>
+    transaction?.vendorId || transaction?.userId || transaction?.customerId || null;
+
+const normalizeTransaction = (transaction, vendorsById) => {
+    const vendorId = transactionVendorId(transaction);
+    const vendor = vendorId ? vendorsById.get(String(vendorId)) : null;
+    const type = String(transaction?.type ?? "");
+    const explicitPlan = transaction?.plan;
+    const plan =
+        explicitPlan ||
+        (/premium|subscription/i.test(type) ? "premium" : "unknown");
+
+    const amount = Number(
+        transaction?.amount ??
+            transaction?.amountTotal ??
+            (transaction?.amountTotalMinor != null
+                ? Number(transaction.amountTotalMinor) / 100
+                : 0)
+    );
+
+    return {
+        ...transaction,
+        vendorId,
+        vendor,
+        plan,
+        amount: Number.isFinite(amount) ? amount : 0,
+        amountTotal: Number.isFinite(amount) ? amount : 0,
+        currency: transaction?.currency || "usd",
+        paymentStatus: transaction?.paymentStatus || transaction?.status || "unknown",
+        status: transaction?.status || transaction?.paymentStatus || "unknown",
+        createdAt: transaction?.createdAt ?? transaction?.updatedAt ?? null,
+    };
+};
 
 export default function createAdminRoutes(db, auth, client) {
     const router = Router();
@@ -10,6 +69,18 @@ export default function createAdminRoutes(db, auth, client) {
     const menuCollection = db.collection("menuItems");
     const ordersCollection = db.collection("orders");
     const transactionsCollection = db.collection("transactions");
+
+    const withAdminMenuFlags = (items) =>
+        items.map((item) => ({
+            ...item,
+            adminPublished: item?.adminPublished !== false,
+            vendorAvailable: item?.isActive === true,
+            publiclyVisible:
+                item?.status === "approved" &&
+                item?.isActive === true &&
+                item?.adminPublished !== false &&
+                item?.isDeleted !== true,
+        }));
 
     const requireAdmin = async (req, res, next) => {
         try {
@@ -150,11 +221,70 @@ export default function createAdminRoutes(db, auth, client) {
     router.get("/menu", requireAdmin, async (req, res) => {
         try {
             const items = await menuCollection
-                .find()
+                .find(NOT_DELETED_FILTER)
                 .sort({ createdAt: -1 })
                 .toArray();
 
-            res.status(200).json(items);
+            const search = String(firstValue(req.query.search) ?? "")
+                .trim()
+                .toLowerCase();
+            const status = String(firstValue(req.query.status) ?? "")
+                .trim()
+                .toLowerCase();
+            const category = String(firstValue(req.query.category) ?? "")
+                .trim()
+                .toLowerCase();
+            const location = String(firstValue(req.query.location) ?? "")
+                .trim()
+                .toLowerCase();
+            const sort = String(firstValue(req.query.sort) ?? "")
+                .trim()
+                .toLowerCase();
+
+            let filtered = items.filter((item) => {
+                if (
+                    search &&
+                    !`${item.name ?? ""} ${item.description ?? ""}`
+                        .toLowerCase()
+                        .includes(search)
+                ) {
+                    return false;
+                }
+
+                if (status && String(item.status ?? "").toLowerCase() !== status) {
+                    return false;
+                }
+
+                if (
+                    category &&
+                    String(item.category ?? "").toLowerCase() !== category
+                ) {
+                    return false;
+                }
+
+                if (
+                    location &&
+                    !String(item.location ?? "")
+                        .toLowerCase()
+                        .includes(location)
+                ) {
+                    return false;
+                }
+
+                return true;
+            });
+
+            if (sort === "price_asc" || sort === "low") {
+                filtered = [...filtered].sort(
+                    (a, b) => Number(a.price ?? 0) - Number(b.price ?? 0)
+                );
+            } else if (sort === "price_desc" || sort === "high") {
+                filtered = [...filtered].sort(
+                    (a, b) => Number(b.price ?? 0) - Number(a.price ?? 0)
+                );
+            }
+
+            res.status(200).json(withAdminMenuFlags(filtered));
         } catch (error) {
             console.error("Fetch menu error:", error.message);
 
@@ -178,25 +308,35 @@ export default function createAdminRoutes(db, auth, client) {
                     });
                 }
 
-                if (!["approved", "rejected"].includes(status)) {
+                if (
+                    !["approved", "rejected", "inactive"].includes(status)
+                ) {
                     return res.status(400).json({
-                        message: "Status must be approved or rejected",
+                        message: "Status must be approved, rejected or inactive",
                     });
                 }
 
+                const pizza = await menuCollection.findOne({
+                    ...NOT_DELETED_FILTER,
+                    _id: new ObjectId(id),
+                });
+
+                if (!pizza) {
+                    return res.status(404).json({
+                        message: "Pizza not found",
+                    });
+                }
+
+                const currentStatus = String(pizza.status ?? "pending");
+                const allowedNext = MENU_STATUS_TRANSITIONS[currentStatus] ?? [];
+
+                if (!allowedNext.includes(status)) {
+                    return res.status(409).json({
+                        message: `Cannot change ${currentStatus} pizza to ${status}`,
+                    });
+                }
 
                 if (status === "approved") {
-                    const pizza = await menuCollection.findOne({
-                        _id: new ObjectId(id),
-                        status: "pending",
-                    });
-
-                    if (!pizza) {
-                        return res.status(409).json({
-                            message: "Pizza not found or no longer pending",
-                        });
-                    }
-
                     if (!pizza.vendorId || !ObjectId.isValid(pizza.vendorId)) {
                         return res.status(400).json({
                             message: "Pizza has an invalid vendor ID",
@@ -207,17 +347,21 @@ export default function createAdminRoutes(db, auth, client) {
                         client,
                         db,
                         vendorId: pizza.vendorId,
-                        activating: true,
+                        // Vendor availability is authoritative. Only legacy
+                        // pending items that are already active count as an
+                        // activation for the free-plan limit.
+                        activating: pizza.isActive === true,
                         mutate: async ({ session }) => {
                             const result = await menuCollection.updateOne(
                                 {
+                                    ...NOT_DELETED_FILTER,
                                     _id: new ObjectId(id),
-                                    status: "pending",
+                                    status: currentStatus,
                                 },
                                 {
                                     $set: {
                                         status: "approved",
-                                        isActive: true,
+                                        adminPublished: true,
                                         reviewedBy: req.user.id,
                                         reviewedAt: new Date(),
                                     },
@@ -227,7 +371,7 @@ export default function createAdminRoutes(db, auth, client) {
 
                             return result.matchedCount
                                 ? { status: 200, message: "Pizza approved successfully" }
-                                : { status: 409, message: "Pizza no longer pending" };
+                                : { status: 409, message: "Pizza status changed. Please refresh." };
                         },
                     });
 
@@ -236,24 +380,30 @@ export default function createAdminRoutes(db, auth, client) {
                     });
                 }
 
+                const updates = {
+                    status,
+                    adminPublished: false,
+                    reviewedBy: req.user.id,
+                    reviewedAt: new Date(),
+                    updatedAt: new Date(),
+                };
+
+                if (status === "rejected") {
+                    updates.isActive = false;
+                }
+
                 const result = await menuCollection.updateOne(
                     {
+                        ...NOT_DELETED_FILTER,
                         _id: new ObjectId(id),
-                        status: "pending",
+                        status: currentStatus,
                     },
-                    {
-                        $set: {
-                            status,
-                            isActive: false,
-                            reviewedBy: req.user.id,
-                            reviewedAt: new Date(),
-                        },
-                    }
+                    { $set: updates }
                 );
 
                 if (result.matchedCount === 0) {
                     return res.status(409).json({
-                        message: "Pizza not found or no longer pending",
+                        message: "Pizza status changed. Please refresh.",
                     });
                 }
 
@@ -269,6 +419,171 @@ export default function createAdminRoutes(db, auth, client) {
             }
         }
     );
+
+    router.patch(
+        "/menu/:id/availability",
+        requireAdmin,
+        async (req, res) => {
+            try {
+                const { id } = req.params;
+                const { isActive } = req.body ?? {};
+
+                if (
+                    !ObjectId.isValid(id) ||
+                    String(new ObjectId(id)) !== id.toLowerCase()
+                ) {
+                    return res.status(400).json({
+                        message: "Invalid pizza ID",
+                    });
+                }
+
+                if (typeof isActive !== "boolean") {
+                    return res.status(400).json({
+                        message: "isActive must be true or false",
+                    });
+                }
+
+                const pizza = await menuCollection.findOne({
+                    ...NOT_DELETED_FILTER,
+                    _id: new ObjectId(id),
+                    status: "approved",
+                });
+
+                if (!pizza) {
+                    return res.status(409).json({
+                        message: "Pizza not found or no longer approved",
+                    });
+                }
+
+                if (!pizza.vendorId || !ObjectId.isValid(pizza.vendorId)) {
+                    return res.status(400).json({
+                        message: "Pizza has an invalid vendor ID",
+                    });
+                }
+
+                const adminPublished = pizza.adminPublished !== false;
+                const vendorAvailable = pizza.isActive === true;
+
+                if (adminPublished === isActive) {
+                    return res.status(200).json({
+                        message: "Admin visibility is already up to date",
+                        isActive,
+                        adminPublished,
+                        vendorAvailable,
+                        publiclyVisible: adminPublished && vendorAvailable,
+                    });
+                }
+
+                const outcome = await withVendorItemLimit({
+                    client,
+                    db,
+                    vendorId: pizza.vendorId,
+                    // Admin publication only makes an item public when the
+                    // vendor has already marked it available.
+                    activating: isActive && vendorAvailable,
+                    mutate: async ({ session }) => {
+                        const result = await menuCollection.updateOne(
+                            {
+                                ...NOT_DELETED_FILTER,
+                                _id: new ObjectId(id),
+                                status: "approved",
+                            },
+                            {
+                                $set: {
+                                    adminPublished: isActive,
+                                    updatedAt: new Date(),
+                                },
+                            },
+                            { session }
+                        );
+
+                        return result.matchedCount
+                            ? {
+                                status: 200,
+                                message: isActive
+                                    ? "Pizza is now publicly visible"
+                                    : "Pizza is hidden from public listings",
+                                isActive,
+                                adminPublished: isActive,
+                                vendorAvailable,
+                                publiclyVisible:
+                                    isActive && vendorAvailable,
+                            }
+                            : {
+                                status: 409,
+                                message:
+                                    "Pizza visibility changed. Please refresh.",
+                            };
+                    },
+                });
+
+                return res.status(outcome.status).json(outcome);
+            } catch (error) {
+                console.error("Pizza visibility error:", error.message);
+
+                return res.status(500).json({
+                    message: "Failed to update pizza visibility",
+                });
+            }
+        }
+    );
+
+    router.delete("/menu/:id", requireAdmin, async (req, res) => {
+        try {
+            const { id } = req.params;
+
+            if (
+                !ObjectId.isValid(id) ||
+                String(new ObjectId(id)) !== id.toLowerCase()
+            ) {
+                return res.status(400).json({
+                    message: "Invalid pizza ID",
+                });
+            }
+
+            const filter = {
+                ...NOT_DELETED_FILTER,
+                _id: new ObjectId(id),
+            };
+
+            const pizza = await menuCollection.findOne(filter);
+
+            if (!pizza) {
+                return res.status(404).json({
+                    message: "Pizza not found",
+                });
+            }
+
+            // Soft delete: keep the document so existing orders and reviews
+            // still reference a real pizza. Public/vendor/admin queries exclude
+            // soft-deleted items via NOT_DELETED_FILTER.
+            const result = await menuCollection.updateOne(filter, {
+                $set: {
+                    adminPublished: false,
+                    isDeleted: true,
+                    deletedAt: new Date(),
+                    deletedBy: req.user.id,
+                    updatedAt: new Date(),
+                },
+            });
+
+            if (result.matchedCount === 0) {
+                return res.status(409).json({
+                    message: "Pizza availability changed. Please refresh.",
+                });
+            }
+
+            return res.status(200).json({
+                message: "Pizza deleted successfully",
+            });
+        } catch (error) {
+            console.error("Admin pizza deletion error:", error.message);
+
+            return res.status(500).json({
+                message: "Failed to delete pizza",
+            });
+        }
+    });
 
     router.patch(
         "/menu/:id/feature",
@@ -292,6 +607,9 @@ export default function createAdminRoutes(db, auth, client) {
 
                 const result = await menuCollection.updateOne(
                     {
+                        ...(isFeatured
+                            ? PUBLIC_MENU_FILTER
+                            : NOT_DELETED_FILTER),
                         _id: new ObjectId(id),
                     },
                     {
@@ -340,11 +658,23 @@ export default function createAdminRoutes(db, auth, client) {
                 usersCollection.countDocuments({ role: "vendor" }),
                 usersCollection.countDocuments({ role: "admin" }),
                 usersCollection.countDocuments({ blocked: true }),
-                menuCollection.countDocuments({}),
-                menuCollection.countDocuments({ status: "pending" }),
-                menuCollection.countDocuments({ status: "approved" }),
-                menuCollection.countDocuments({ status: "rejected" }),
-                menuCollection.countDocuments({ isFeatured: true }),
+                menuCollection.countDocuments(NOT_DELETED_FILTER),
+                menuCollection.countDocuments({
+                    ...NOT_DELETED_FILTER,
+                    status: "pending",
+                }),
+                menuCollection.countDocuments({
+                    ...NOT_DELETED_FILTER,
+                    status: "approved",
+                }),
+                menuCollection.countDocuments({
+                    ...NOT_DELETED_FILTER,
+                    status: "rejected",
+                }),
+                menuCollection.countDocuments({
+                    ...PUBLIC_MENU_FILTER,
+                    isFeatured: true,
+                }),
             ]);
 
             const [orderStatsDoc] = await ordersCollection
@@ -424,8 +754,25 @@ export default function createAdminRoutes(db, auth, client) {
                             revenue: {
                                 $sum: {
                                     $cond: [
-                                        { $ne: ["$status", "cancelled"] },
-                                        { $ifNull: ["$totalPrice", 0] },
+                                        {
+                                            $in: [
+                                                { $ifNull: ["$status", ""] },
+                                                REVENUE_ORDER_STATUSES,
+                                            ],
+                                        },
+                                        {
+                                            $convert: {
+                                                input: {
+                                                    $ifNull: [
+                                                        "$totalPrice",
+                                                        0,
+                                                    ],
+                                                },
+                                                to: "double",
+                                                onError: 0,
+                                                onNull: 0,
+                                            },
+                                        },
                                         0,
                                     ],
                                 },
@@ -443,13 +790,39 @@ export default function createAdminRoutes(db, auth, client) {
                         $group: {
                             _id: null,
                             total: { $sum: 1 },
+                            successful: {
+                                $sum: {
+                                    $cond: [
+                                        {
+                                            $in: [
+                                                { $ifNull: ["$status", ""] },
+                                                [
+                                                    "paid",
+                                                    "succeeded",
+                                                    "success",
+                                                    "complete",
+                                                    "completed",
+                                                ],
+                                            ],
+                                        },
+                                        1,
+                                        0,
+                                    ],
+                                },
+                            },
                             completedAmount: {
                                 $sum: {
                                     $cond: [
                                         {
                                             $in: [
                                                 { $ifNull: ["$status", ""] },
-                                                ["succeeded", "completed"],
+                                                [
+                                                    "paid",
+                                                    "succeeded",
+                                                    "success",
+                                                    "complete",
+                                                    "completed",
+                                                ],
                                             ],
                                         },
                                         {
@@ -539,6 +912,7 @@ export default function createAdminRoutes(db, auth, client) {
                 },
                 transactions: {
                     total: transactionStats.total || 0,
+                    successful: transactionStats.successful || 0,
                     completedAmount: Number(
                         (transactionStats.completedAmount || 0).toFixed(2)
                     ),
@@ -575,7 +949,39 @@ export default function createAdminRoutes(db, auth, client) {
                 .limit(limit)
                 .toArray();
 
-            res.status(200).json(transactions);
+            const vendorIds = [
+                ...new Set(
+                    transactions
+                        .map(transactionVendorId)
+                        .filter((id) => id && ObjectId.isValid(id))
+                        .map((id) => String(id))
+                ),
+            ];
+
+            const vendors = vendorIds.length
+                ? await usersCollection
+                      .find(
+                          { _id: { $in: vendorIds.map((id) => new ObjectId(id)) } },
+                          {
+                              projection: {
+                                  name: 1,
+                                  email: 1,
+                                  businessName: 1,
+                              },
+                          }
+                      )
+                      .toArray()
+                : [];
+
+            const vendorsById = new Map(
+                vendors.map((vendor) => [String(vendor._id), vendor])
+            );
+
+            res.status(200).json(
+                transactions.map((transaction) =>
+                    normalizeTransaction(transaction, vendorsById)
+                )
+            );
         } catch (error) {
             console.error("Fetch transactions error:", error.message);
 

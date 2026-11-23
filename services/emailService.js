@@ -25,7 +25,7 @@ function buildOrderLink(clientUrl, orderId) {
             return null;
         }
 
-        return `${url.origin}/order/${encodeURIComponent(String(orderId))}`;
+        return `${url.origin}/customer/dashboard?orderId=${encodeURIComponent(String(orderId))}`;
     } catch {
         return null;
     }
